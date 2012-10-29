@@ -350,7 +350,6 @@ static int last_thread = -1;
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
                        int read_buffer_size, enum network_transport transport) {
     CQ_ITEM *item = cqi_new();
-    char buf[1];
     if (item == NULL) {
         close(sfd);
         /* given that malloc failed this may also fail, but let's try */
