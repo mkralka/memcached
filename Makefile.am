@@ -14,6 +14,7 @@ memcached_SOURCES = memcached.c memcached.h \
                     items.c items.h \
                     assoc.c assoc.h \
                     thread.c daemon.c \
+                    percentiles.c percentiles.h \
                     stats.c stats.h \
                     util.c util.h \
                     trace.h cache.h sasl_defs.h

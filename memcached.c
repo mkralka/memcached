@@ -14,6 +14,7 @@
  *      Brad Fitzpatrick <brad@danga.com>
  */
 #include "memcached.h"
+#include "percentiles.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -57,6 +58,7 @@
 /*
  * forward declarations
  */
+static hires_time_t get_us_time(void);
 static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
 static int try_read_command(conn *c);
@@ -76,7 +78,7 @@ static void conn_set_state(conn *c, enum conn_states state);
 /* stats */
 static void stats_init(void);
 static void server_stats(ADD_STAT add_stats, conn *c);
-static void process_stat_settings(ADD_STAT add_stats, void *c);
+static int process_stat_settings(ADD_STAT add_stats, void *c);
 
 
 /* defaults */
@@ -166,7 +168,16 @@ static rel_time_t realtime(const time_t exptime) {
     }
 }
 
+static void stats_report_latency(stat_cmd_t cmd, hires_time_t latency) {
+    if (cmd < STAT_CMD_COUNT) {
+        STATS_LOCK();
+        percentile_sampler_record_sample(&stats.per_cmd_stats[cmd].handle_latency, latency);
+        STATS_UNLOCK();
+    }
+}
+
 static void stats_init(void) {
+    size_t i;
     stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
     stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = 0;
     stats.touch_cmds = stats.touch_misses = stats.touch_hits = stats.rejected_conns = 0;
@@ -178,6 +189,9 @@ static void stats_init(void) {
     stats.accepting_conns = true; /* assuming we start in this state. */
     stats.slab_reassign_running = false;
 
+    for (i = 0; i < sizeof(stats.per_cmd_stats)/sizeof(*stats.per_cmd_stats); ++i)
+        cmd_stats_init(&stats.per_cmd_stats[i]);
+
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
        like 'settings.oldest_live' which act as booleans as well as
@@ -187,6 +201,7 @@ static void stats_init(void) {
 }
 
 static void stats_reset(void) {
+    size_t i;
     STATS_LOCK();
     stats.total_items = stats.total_conns = 0;
     stats.rejected_conns = 0;
@@ -195,6 +210,10 @@ static void stats_reset(void) {
     stats.reclaimed = 0;
     stats.listen_disabled_num = 0;
     stats_prefix_clear();
+
+    for (i = 0; i < sizeof(stats.per_cmd_stats)/sizeof(*stats.per_cmd_stats); ++i)
+        cmd_stats_reset(&stats.per_cmd_stats[i]);
+
     STATS_UNLOCK();
     threadlocal_stats_reset();
     item_stats_reset();
@@ -1821,6 +1840,8 @@ static void dispatch_bin_command(conn *c) {
     int extlen = c->binary_header.request.extlen;
     int keylen = c->binary_header.request.keylen;
     uint32_t bodylen = c->binary_header.request.bodylen;
+    hires_time_t start = get_us_time();
+    stat_cmd_t cmd = stat_cmd_other;
 
     if (settings.sasl && !authenticated(c)) {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, 0);
@@ -1909,6 +1930,7 @@ static void dispatch_bin_command(conn *c) {
         case PROTOCOL_BINARY_CMD_SET: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_ADD: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_REPLACE:
+            cmd = stat_cmd_set;
             if (extlen == 8 && keylen != 0 && bodylen >= (keylen + 8)) {
                 bin_read_key(c, bin_reading_set_header, 8);
             } else {
@@ -1919,6 +1941,7 @@ static void dispatch_bin_command(conn *c) {
         case PROTOCOL_BINARY_CMD_GET:   /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_GETKQ: /* FALLTHROUGH */
         case PROTOCOL_BINARY_CMD_GETK:
+            cmd = stat_cmd_get;
             if (extlen == 0 && bodylen == keylen && keylen > 0) {
                 bin_read_key(c, bin_reading_get_key, 0);
             } else {
@@ -1926,6 +1949,7 @@ static void dispatch_bin_command(conn *c) {
             }
             break;
         case PROTOCOL_BINARY_CMD_DELETE:
+            cmd = stat_cmd_del;
             if (keylen > 0 && extlen == 0 && bodylen == keylen) {
                 bin_read_key(c, bin_reading_del_header, extlen);
             } else {
@@ -1934,6 +1958,7 @@ static void dispatch_bin_command(conn *c) {
             break;
         case PROTOCOL_BINARY_CMD_INCREMENT:
         case PROTOCOL_BINARY_CMD_DECREMENT:
+            cmd = stat_cmd_arithmetic;
             if (keylen > 0 && extlen == 20 && bodylen == (keylen + extlen)) {
                 bin_read_key(c, bin_reading_incr_header, 20);
             } else {
@@ -1942,6 +1967,7 @@ static void dispatch_bin_command(conn *c) {
             break;
         case PROTOCOL_BINARY_CMD_APPEND:
         case PROTOCOL_BINARY_CMD_PREPEND:
+            cmd = stat_cmd_set;
             if (keylen > 0 && extlen == 0) {
                 bin_read_key(c, bin_reading_set_header, 0);
             } else {
@@ -1998,6 +2024,8 @@ static void dispatch_bin_command(conn *c) {
 
     if (protocol_error)
         handle_binary_protocol_error(c);
+    else
+        stats_report_latency(cmd, start - get_us_time());
 }
 
 static void process_bin_update(conn *c) {
@@ -2523,31 +2551,57 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
     add_stats(name, strlen(name), val_str, vlen, c);
 }
 
-inline static void process_stats_detail(conn *c, const char *command) {
+inline static int process_stats_detail(conn *c, const char *command) {
     assert(c != NULL);
 
     if (strcmp(command, "on") == 0) {
         settings.detail_enabled = 1;
         out_string(c, "OK");
+        return 0;
     }
     else if (strcmp(command, "off") == 0) {
         settings.detail_enabled = 0;
         out_string(c, "OK");
+        return 0;
     }
     else if (strcmp(command, "dump") == 0) {
         int len;
         char *stats = stats_prefix_dump(&len);
         write_and_free(c, stats, len);
+        return 0;
     }
     else {
         out_string(c, "CLIENT_ERROR usage: stats detail on|off|dump");
+        return -1;
     }
+}
+
+static const char *stat_cmd_name(stat_cmd_t cmd) {
+    switch(cmd) {
+    case stat_cmd_set:
+        return "set";
+    case stat_cmd_get:
+        return "get";
+    case stat_cmd_del:
+        return "delete";
+    case stat_cmd_arithmetic:
+        return "arithmetic";
+    case stat_cmd_other:
+        return "other";
+    }
+    return "???";
 }
 
 /* return server specific stats only */
 static void server_stats(ADD_STAT add_stats, conn *c) {
+    static const double reported_percentiles[] = { 0.50, 0.75, 0.90, 0.95, 0.99, 0.999 };
+    static const char *const reported_percentile_names[] = { "p50", "p75", "p90", "p95", "p99", "p999" };
+    char key_str[STAT_KEY_LEN];
+    char val_str[STAT_VAL_LEN];
+    int klen = 0, vlen = 0;
     pid_t pid = getpid();
     rel_time_t now = current_time;
+    stat_cmd_t cmd;
 
     struct thread_stats thread_stats;
     threadlocal_stats_aggregate(&thread_stats);
@@ -2621,10 +2675,23 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     }
     APPEND_STAT("malloc_fails", "%llu",
                 (unsigned long long)stats.malloc_fails);
+    for (cmd = 0; cmd < STAT_CMD_COUNT; ++cmd) {
+        const char *const cmd_str = stat_cmd_name(cmd);
+        cmd_stats_t *const cmd_stats = &stats.per_cmd_stats[cmd];
+        percentile_sample_t percentiles[sizeof(reported_percentiles)/sizeof(*reported_percentiles)];
+        size_t i;
+        percentile_sampler_snapshot(&cmd_stats->handle_latency, percentiles, reported_percentiles,
+                                    sizeof(reported_percentiles)/sizeof(*reported_percentiles));
+
+        for (i = 0; i < sizeof(percentiles)/sizeof(*percentiles); ++i) {
+            APPEND_NUM_FMT_STAT("latency:%s:%s", cmd_str, reported_percentile_names[i], "%llu", percentiles[i]);
+        }
+    }
+
     STATS_UNLOCK();
 }
 
-static void process_stat_settings(ADD_STAT add_stats, void *c) {
+static int process_stat_settings(ADD_STAT add_stats, void *c) {
     assert(add_stats);
     APPEND_STAT("maxbytes", "%u", (unsigned int)settings.maxbytes);
     APPEND_STAT("maxconns", "%d", settings.maxconns);
@@ -2655,15 +2722,16 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
     APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
     APPEND_STAT("slab_automove", "%d", settings.slab_automove);
+    return 0;
 }
 
-static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
+static int process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     const char *subcommand = tokens[SUBCOMMAND_TOKEN].value;
     assert(c != NULL);
 
     if (ntokens < 2) {
         out_string(c, "CLIENT_ERROR bad command line");
-        return;
+        return -1;
     }
 
     if (ntokens == 2) {
@@ -2672,40 +2740,38 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     } else if (strcmp(subcommand, "reset") == 0) {
         stats_reset();
         out_string(c, "RESET");
-        return ;
+        return 0;
     } else if (strcmp(subcommand, "detail") == 0) {
         /* NOTE: how to tackle detail with binary? */
         if (ntokens < 4)
-            process_stats_detail(c, "");  /* outputs the error message */
+            return process_stats_detail(c, "");  /* outputs the error message */
         else
-            process_stats_detail(c, tokens[2].value);
-        /* Output already generated */
-        return ;
+            return process_stats_detail(c, tokens[2].value);
     } else if (strcmp(subcommand, "settings") == 0) {
-        process_stat_settings(&append_stats, c);
+        return process_stat_settings(&append_stats, c);
     } else if (strcmp(subcommand, "cachedump") == 0) {
         char *buf;
         unsigned int bytes, id, limit = 0;
 
         if (ntokens < 5) {
             out_string(c, "CLIENT_ERROR bad command line");
-            return;
+            return -1;
         }
 
         if (!safe_strtoul(tokens[2].value, &id) ||
             !safe_strtoul(tokens[3].value, &limit)) {
             out_string(c, "CLIENT_ERROR bad command line format");
-            return;
+            return -1;
         }
 
         if (id >= POWER_LARGEST) {
             out_string(c, "CLIENT_ERROR Illegal slab id");
-            return;
+            return -1;
         }
 
         buf = item_cachedump(id, limit, &bytes);
         write_and_free(c, buf, bytes);
-        return ;
+        return 0;
     } else {
         /* getting here means that the subcommand is either engine specific or
            is invalid. query the engine and see. */
@@ -2715,11 +2781,12 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
             } else {
                 write_and_free(c, c->stats.buffer, c->stats.offset);
                 c->stats.buffer = NULL;
+                return 0;
             }
         } else {
             out_string(c, "ERROR");
         }
-        return ;
+        return -1;
     }
 
     /* append terminator and start the transfer */
@@ -2730,11 +2797,13 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     } else {
         write_and_free(c, c->stats.buffer, c->stats.offset);
         c->stats.buffer = NULL;
+        return 0;
     }
+    return -1;
 }
 
 /* ntokens is overwritten here... shrug.. */
-static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
+static inline int process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
     char *key;
     size_t nkey;
     int i = 0;
@@ -2751,7 +2820,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
             if(nkey > KEY_MAX_LENGTH) {
                 out_string(c, "CLIENT_ERROR bad command line format");
-                return;
+                return -1;
             }
 
             it = item_get(key, nkey);
@@ -2808,7 +2877,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       STATS_UNLOCK();
                       out_string(c, "SERVER_ERROR out of memory making CAS suffix");
                       item_remove(it);
-                      return;
+                      return -1;
                   }
                   *(c->suffixlist + i) = suffix;
                   int suffix_len = snprintf(suffix, SUFFIX_SIZE,
@@ -2890,16 +2959,17 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
     if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
         || (IS_UDP(c->transport) && build_udp_headers(c) != 0)) {
         out_string(c, "SERVER_ERROR out of memory writing get response");
+        return -1;
     }
     else {
         conn_set_state(c, conn_mwrite);
         c->msgcurr = 0;
     }
 
-    return;
+    return 0;
 }
 
-static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
+static int process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
     unsigned int flags;
@@ -2915,7 +2985,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     key = tokens[KEY_TOKEN].value;
@@ -2925,7 +2995,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
            && safe_strtol(tokens[3].value, &exptime_int)
            && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
@@ -2941,14 +3011,14 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     if (handle_cas) {
         if (!safe_strtoull(tokens[5].value, &req_cas_id)) {
             out_string(c, "CLIENT_ERROR bad command line format");
-            return;
+            return -1;
         }
     }
 
     vlen += 2;
     if (vlen < 0 || vlen - 2 < 0) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     if (settings.detail_enabled) {
@@ -2976,7 +3046,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             }
         }
 
-        return;
+        return -1;
     }
     ITEM_set_cas(it, req_cas_id);
 
@@ -2985,9 +3055,10 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     c->rlbytes = it->nbytes;
     c->cmd = comm;
     conn_set_state(c, conn_nread);
+    return 0;
 }
 
-static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
+static int process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key;
     size_t nkey;
     int32_t exptime_int = 0;
@@ -2999,7 +3070,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
 
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     key = tokens[KEY_TOKEN].value;
@@ -3007,7 +3078,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
 
     if (!safe_strtol(tokens[2].value, &exptime_int)) {
         out_string(c, "CLIENT_ERROR invalid exptime argument");
-        return;
+        return -1;
     }
 
     it = item_touch(key, nkey, realtime(exptime_int));
@@ -3028,9 +3099,10 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
 
         out_string(c, "NOT_FOUND");
     }
+    return 0;
 }
 
-static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
+static int process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
     char temp[INCR_MAX_STORAGE_LEN];
     uint64_t delta;
     char *key;
@@ -3042,7 +3114,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     key = tokens[KEY_TOKEN].value;
@@ -3050,7 +3122,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 
     if (!safe_strtoull(tokens[2].value, &delta)) {
         out_string(c, "CLIENT_ERROR invalid numeric delta argument");
-        return;
+        return -1;
     }
 
     switch(add_delta(c, key, nkey, incr, delta, temp, NULL)) {
@@ -3059,10 +3131,10 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         break;
     case NON_NUMERIC:
         out_string(c, "CLIENT_ERROR cannot increment or decrement non-numeric value");
-        break;
+        return -1;
     case EOM:
         out_string(c, "SERVER_ERROR out of memory");
-        break;
+        return -1;
     case DELTA_ITEM_NOT_FOUND:
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (incr) {
@@ -3075,8 +3147,9 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
         out_string(c, "NOT_FOUND");
         break;
     case DELTA_ITEM_CAS_MISMATCH:
-        break; /* Should never get here */
+        return -1; /* Should never get here */
     }
+    return 0;
 }
 
 /*
@@ -3171,7 +3244,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     return OK;
 }
 
-static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
+static int process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key;
     size_t nkey;
     item *it;
@@ -3186,7 +3259,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         if (!valid) {
             out_string(c, "CLIENT_ERROR bad command line format.  "
                        "Usage: delete <key> [noreply]");
-            return;
+            return -1;
         }
     }
 
@@ -3196,7 +3269,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
 
     if(nkey > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
-        return;
+        return -1;
     }
 
     if (settings.detail_enabled) {
@@ -3221,9 +3294,10 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
 
         out_string(c, "NOT_FOUND");
     }
+    return 0;
 }
 
-static void process_verbosity_command(conn *c, token_t *tokens, const size_t ntokens) {
+static int process_verbosity_command(conn *c, token_t *tokens, const size_t ntokens) {
     unsigned int level;
 
     assert(c != NULL);
@@ -3233,10 +3307,10 @@ static void process_verbosity_command(conn *c, token_t *tokens, const size_t nto
     level = strtoul(tokens[1].value, NULL, 10);
     settings.verbose = level > MAX_VERBOSITY_LEVEL ? MAX_VERBOSITY_LEVEL : level;
     out_string(c, "OK");
-    return;
+    return 0;
 }
 
-static void process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
+static int process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
     unsigned int level;
 
     assert(c != NULL);
@@ -3250,10 +3324,10 @@ static void process_slabs_automove_command(conn *c, token_t *tokens, const size_
         settings.slab_automove = level;
     } else {
         out_string(c, "ERROR");
-        return;
+        return 1;
     }
     out_string(c, "OK");
-    return;
+    return 0;
 }
 
 static void process_command(conn *c, char *command) {
@@ -3261,6 +3335,9 @@ static void process_command(conn *c, char *command) {
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
     int comm;
+    int rc = -1;
+    const hires_time_t start = get_us_time();
+    stat_cmd_t cmd = stat_cmd_other;
 
     assert(c != NULL);
 
@@ -3287,7 +3364,8 @@ static void process_command(conn *c, char *command) {
         ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
          (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
 
-        process_get_command(c, tokens, ntokens, false);
+        cmd = stat_cmd_get;
+        rc = process_get_command(c, tokens, ntokens, false);
 
     } else if ((ntokens == 6 || ntokens == 7) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
@@ -3296,38 +3374,43 @@ static void process_command(conn *c, char *command) {
                 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
 
-        process_update_command(c, tokens, ntokens, comm, false);
+        cmd = stat_cmd_set;
+        rc = process_update_command(c, tokens, ntokens, comm, false);
 
     } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
 
-        process_update_command(c, tokens, ntokens, comm, true);
+        cmd = stat_cmd_set;
+        rc = process_update_command(c, tokens, ntokens, comm, true);
 
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
 
-        process_arithmetic_command(c, tokens, ntokens, 1);
+        cmd = stat_cmd_arithmetic;
+        rc = process_arithmetic_command(c, tokens, ntokens, 1);
 
     } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
 
-        process_get_command(c, tokens, ntokens, true);
+        cmd = stat_cmd_get;
+        rc = process_get_command(c, tokens, ntokens, true);
 
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
-        process_arithmetic_command(c, tokens, ntokens, 0);
+        cmd = stat_cmd_arithmetic;
+        rc = process_arithmetic_command(c, tokens, ntokens, 0);
 
     } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
-        process_delete_command(c, tokens, ntokens);
+        cmd = stat_cmd_del;
+        rc = process_delete_command(c, tokens, ntokens);
 
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
 
-        process_touch_command(c, tokens, ntokens);
+        rc = process_touch_command(c, tokens, ntokens);
 
     } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
 
-        process_stat(c, tokens, ntokens);
+        rc = process_stat(c, tokens, ntokens);
 
     } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
-        time_t exptime = 0;
 
         set_noreply_maybe(c, tokens, ntokens);
 
@@ -3337,34 +3420,34 @@ static void process_command(conn *c, char *command) {
 
         if(ntokens == (c->noreply ? 3 : 2)) {
             settings.oldest_live = current_time - 1;
-            item_flush_expired();
-            out_string(c, "OK");
-            return;
+        } else {
+            time_t exptime = 0;
+            exptime = strtol(tokens[1].value, NULL, 10);
+            if(errno == ERANGE) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+
+            /*
+              If exptime is zero realtime() would return zero too, and
+              realtime(exptime) - 1 would overflow to the max unsigned
+              value.  So we process exptime == 0 the same way we do when
+              no delay is given at all.
+            */
+            if (exptime > 0)
+                settings.oldest_live = realtime(exptime) - 1;
+            else /* exptime == 0 */
+                settings.oldest_live = current_time - 1;
         }
 
-        exptime = strtol(tokens[1].value, NULL, 10);
-        if(errno == ERANGE) {
-            out_string(c, "CLIENT_ERROR bad command line format");
-            return;
-        }
-
-        /*
-          If exptime is zero realtime() would return zero too, and
-          realtime(exptime) - 1 would overflow to the max unsigned
-          value.  So we process exptime == 0 the same way we do when
-          no delay is given at all.
-        */
-        if (exptime > 0)
-            settings.oldest_live = realtime(exptime) - 1;
-        else /* exptime == 0 */
-            settings.oldest_live = current_time - 1;
         item_flush_expired();
         out_string(c, "OK");
-        return;
+        rc = 0;
 
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
 
         out_string(c, "VERSION " VERSION);
+        rc = 0;
 
     } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
 
@@ -3391,6 +3474,7 @@ static void process_command(conn *c, char *command) {
             switch (rv) {
             case REASSIGN_OK:
                 out_string(c, "OK");
+                rc = 0;
                 break;
             case REASSIGN_RUNNING:
                 out_string(c, "BUSY currently processing reassign request");
@@ -3405,19 +3489,20 @@ static void process_command(conn *c, char *command) {
                 out_string(c, "SAME src and dst class are identical");
                 break;
             }
-            return;
         } else if (ntokens == 4 &&
             (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
-            process_slabs_automove_command(c, tokens, ntokens);
+            rc = process_slabs_automove_command(c, tokens, ntokens);
         } else {
             out_string(c, "ERROR");
         }
     } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
-        process_verbosity_command(c, tokens, ntokens);
+        rc = process_verbosity_command(c, tokens, ntokens);
     } else {
         out_string(c, "ERROR");
     }
-    return;
+
+    if (rc == 0)
+        stats_report_latency(cmd, get_us_time() - start);
 }
 
 /*
@@ -4437,6 +4522,10 @@ static int server_socket_unix(const char *path, int access_mask) {
 volatile rel_time_t current_time;
 static struct event clockevent;
 
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+static bool monotonic = false;
+#endif
+
 /* libevent uses a monotonic clock when available for event scheduling. Aside
  * from jitter, simply ticking our internal timer here is accurate enough.
  * Note that users who are setting explicit dates for expiration times *must*
@@ -4445,7 +4534,6 @@ static void clock_handler(const int fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 1, .tv_usec = 0};
     static bool initialized = false;
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
-    static bool monotonic = false;
     static time_t monotonic_start;
 #endif
 
@@ -4483,6 +4571,30 @@ static void clock_handler(const int fd, const short which, void *arg) {
         gettimeofday(&tv, NULL);
         current_time = (rel_time_t) (tv.tv_sec - process_started);
     }
+}
+
+/*
+ * Get the number of microseconds since some arbitrary point.
+ */
+static hires_time_t get_us_time() {
+    hires_time_t result;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+    if (monotonic) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        result = ts.tv_sec;
+        result *= 1000000;
+        result += ts.tv_nsec / 1000;
+    } else
+#endif
+    {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        result = tv.tv_sec;
+        result *= 1000000;
+        result += tv.tv_usec;
+    }
+    return result;
 }
 
 static void usage(void) {

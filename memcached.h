@@ -22,6 +22,7 @@
 #include "cache.h"
 
 #include "sasl_defs.h"
+#include "percentiles.h"
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
@@ -200,6 +201,9 @@ enum delta_result_type {
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
 
+/** Time relative to some arbitrary epoch with microsecond resolution. */
+typedef unsigned long long hires_time_t;
+
 /** Stats stored per slab (and per thread). */
 struct slab_stats {
     uint64_t  set_cmds;
@@ -234,11 +238,33 @@ struct thread_stats {
     struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
 };
 
+enum stat_cmd {
+    stat_cmd_set,
+    stat_cmd_get,
+    stat_cmd_del,
+    stat_cmd_arithmetic,
+    stat_cmd_other,
+};
+#define STAT_CMD_COUNT ((stat_cmd_t)(stat_cmd_other + 1))
+typedef enum stat_cmd stat_cmd_t;
+
+struct cmd_stats {
+    percentile_sampler_t handle_latency;
+};
+typedef struct cmd_stats cmd_stats_t;
+
+static inline void cmd_stats_init(cmd_stats_t *stats) {
+    percentile_sampler_init(&stats->handle_latency);
+}
+
+static inline void cmd_stats_reset(cmd_stats_t *stats) {
+    percentile_sampler_reset(&stats->handle_latency);
+}
+
 /**
  * Global stats.
  */
 struct stats {
-    pthread_mutex_t mutex;
     unsigned int  curr_items;
     unsigned int  total_items;
     uint64_t      curr_bytes;
@@ -267,6 +293,8 @@ struct stats {
     uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
+    /* Per command stats */
+    cmd_stats_t   per_cmd_stats[STAT_CMD_COUNT];
 };
 
 #define MAX_VERBOSITY_LEVEL 2
